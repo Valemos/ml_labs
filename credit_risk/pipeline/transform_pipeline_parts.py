@@ -16,8 +16,8 @@ class TransformerWithoutFit(TransformerMixin, BaseEstimator):
         return self
 
 
-class DropUnnecessary(TransformerWithoutFit):
-    unimportant_columns = ["SK_ID_CURR", "NAME_TYPE_SUITE", "DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION",
+class DropUnnecessaryColumns(TransformerWithoutFit):
+    unimportant_columns = ["NAME_TYPE_SUITE", "DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION",
                            "DAYS_ID_PUBLISH", "WEEKDAY_APPR_PROCESS_START", "HOUR_APPR_PROCESS_START",
                            "REGION_RATING_CLIENT", "DAYS_LAST_PHONE_CHANGE", "OBS_30_CNT_SOCIAL_CIRCLE",
                            "DEF_30_CNT_SOCIAL_CIRCLE", "OBS_60_CNT_SOCIAL_CIRCLE", "DEF_60_CNT_SOCIAL_CIRCLE",
@@ -43,7 +43,7 @@ class DropColumns(TransformerWithoutFit):
         return df.drop(columns=self.columns)
 
 
-class TypeTransformer(TransformerWithoutFit):
+class CategoryTypeTransformer(TransformerWithoutFit):
 
     feat_categorical = {"TARGET", "CODE_GENDER", "NAME_CONTRACT_TYPE", "FLAG_OWN_CAR", "FLAG_OWN_REALTY",
                         "NAME_INCOME_TYPE", "NAME_EDUCATION_TYPE", "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE",
@@ -53,13 +53,16 @@ class TypeTransformer(TransformerWithoutFit):
 
     def transform(self, df, **transform_params):
         for feature in self.feat_categorical:
-            df[feature] = df[feature].astype("category")
+            if feature in df.columns:
+                df[feature] = df[feature].astype("category")
         return df
 
 
 class FillNA(TransformerMixin, BaseEstimator):
 
     def __init__(self, columns, strategy, **kwargs):
+        self.columns = columns
+        self.strategy = strategy
         self.imputers : Dict[SimpleImputer] = {col: SimpleImputer(strategy=strategy, **kwargs) for col in columns}
 
     def fit(self, df, y=None, **params):
@@ -71,6 +74,35 @@ class FillNA(TransformerMixin, BaseEstimator):
     def transform(self, df, **params):
         for col, imputer in self.imputers.items():
             df[col] = imputer.transform(np.asarray(df[col]).reshape(-1, 1))
+        return df
+
+
+class ReplaceUnknownCategories(TransformerMixin, BaseEstimator):
+
+    def __init__(self, column, default_value):
+        self.column = column
+        self.default_value = default_value
+
+    def fit(self, df, y=None, **params):
+        self.values = df[self.column].unique()
+        return self
+
+    def transform(self, df, **transform_params):
+        replacement = {}
+        for col in df[self.column].unique():
+            if col not in self.values:
+                replacement[col] = self.default_value
+
+        return df
+
+
+class ReplaceRedundantCategories(TransformerWithoutFit):
+    
+    def transform(self, df, **transform_params):
+        df["CODE_GENDER"].replace({"XNA": "M"}, inplace=True)
+        df["NAME_FAMILY_STATUS"].replace({"Single / not married": "Single", "Unknown": "Single"}, inplace=True)
+        df["REGION_RATING_CLIENT_W_CITY"].replace({-1: 1}, inplace=True)
+        df["NAME_INCOME_TYPE"].replace({"Maternity leave": "Pensioner"}, inplace=True)
         return df
 
 
@@ -108,8 +140,16 @@ class BuildingColumnsTransformer(TransformerWithoutFit):
     columns_trimmed = ['APARTMENTS_MODE', 'ENTRANCES_AVG']
 
     def transform(self, df: DataFrame, **params):
-        return df.drop(columns=[c for c in self.columns if c not in self.columns_trimmed]) \
-                .dropna(axis="index", subset=["APARTMENTS_MODE"])
+        return FillNA(self.columns_trimmed, "mean") \
+            .fit_transform(
+                df.drop(columns=[c for c in self.columns if c not in self.columns_trimmed])
+            )
+
+
+class DropRowsByBuilding(TransformerWithoutFit):
+
+    def transform(self, df: DataFrame, **params):
+        return df.dropna(axis="index", subset=["APARTMENTS_MODE"])
 
 
 class CarOwnAgeTransformer(TransformerWithoutFit):
@@ -163,15 +203,31 @@ class ScaleValues(TransformerMixin, BaseEstimator):
         return df
 
 
-class EncodeBinaryCategoricalValues(TransformerWithoutFit):
+class EncodeCategoricalValues(TransformerMixin, BaseEstimator):
 
-    def transform(self, df, **params):
+    def fit(self, df: DataFrame, y=None, **params):
+        self.categories = {name: df[name].unique() for name in df.select_dtypes("category").columns}
+        return self
+
+    def transform(self, df: pd.DataFrame, **params):
         categorical_features = df.select_dtypes("category")
 
         for feature in categorical_features.columns:
-            if len(df[feature].unique()) == 2:
+            cur_values = df[feature].unique()
+            
+            # set categories
+            if len(cur_values) != len(self.categories[feature]):
+                # can produce NaN if self.categories contains less categories than current categories
+                df[feature].cat.set_categories(self.categories[feature])
+
+            # encode binary categories as one value
+            if len(cur_values) == 2:
                 df[feature] = df[feature].cat.codes
-        return df
+
+        # encode everything else
+        categorical_features = df.select_dtypes("category")
+        dummies = pd.get_dummies(categorical_features)
+        return pd.concat([df.drop(columns=categorical_features.columns), dummies], axis=1)
 
 
 class ClusterizeIncomeTotal(BaseEstimator, TransformerMixin):
@@ -193,14 +249,6 @@ class ClusterizeIncomeTotal(BaseEstimator, TransformerMixin):
 
     def to_clusters(self, df):
         return self.kmeans.predict(np.asarray(df[self.feature_income_total]).reshape(-1, 1))
-
-
-class EncodeOtherCategoricalValues(TransformerWithoutFit):
-
-    def transform(self, df: pd.DataFrame, **params):
-        categorical_features = df.select_dtypes("category")
-        dummies = pd.get_dummies(categorical_features)
-        return pd.concat([df.drop(columns=categorical_features.columns), dummies], axis=1)
 
 
 class UpsampleByTarget(TransformerWithoutFit):
