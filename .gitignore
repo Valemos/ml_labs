@@ -1,3 +1,5 @@
 .ipynb_checkpoints/*
+.vscode/
 /credit_risk/data/
 credit_risk/predictions.csv
+**.model
